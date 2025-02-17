@@ -107,3 +107,6 @@ O webserver permite um controle remoto simples, acessível via navegador.
 Expansibilidade:
  O protótipo pode ser expandido para incluir funcionalidades adicionais, como notificações via rede, armazenamento de logs ou ajustes dinâmicos de parâmetros.
 
+
+
+
