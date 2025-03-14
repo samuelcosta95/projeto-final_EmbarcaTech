@@ -26,14 +26,26 @@ const uint LED_GREEN_PIN = 11;
 const uint LED_BLUE_PIN = 12; 
 
 // Wi-Fi
-#define WIFI_SSID "NOME_WIFI"
-#define WIFI_PASS "SENHA_WIFI"
+#define WIFI_SSID "PIPOCA"
+#define WIFI_PASS "33221194"
 
 // Configurações do ADC para detecção de som
 const float SOUND_OFFSET = 1.65; 
 const float SOUND_THRESHOLD = 0.25; 
 const float ADC_REF = 3.3;         
 const int ADC_RES = 4095;          
+
+const uint DETECTION_DURATION_MS = 10000;  // 10 segundos
+const uint SAMPLE_WINDOW_MS = 50;         // Janela de amostragem
+const uint MIN_ACTIVE_SAMPLES = 40;
+
+static uint32_t sample_buffer[200] = {0};  // Buffer circular para 10s
+static uint sample_index = 0;
+static uint active_samples_count = 0;
+
+static absolute_time_t detection_start_time;
+static uint sound_detection_count = 0;
+static bool is_detecting = false;
 
 // Estado do sistema
 volatile bool system_active = false;
@@ -212,7 +224,7 @@ int main() {
     // Wi-Fi
     if (cyw43_arch_init()) {
         printf("Erro ao inicializar o Wi-Fi\n");
-        return 1;
+        
     }
 
     cyw43_arch_enable_sta_mode();
@@ -220,7 +232,7 @@ int main() {
 
     if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 10000)){
         printf("Falha ao conectar ao Wi-Fi\n");
-        return 1;
+        
     } 
     printf("Conectado!\nIP: %d.%d.%d.%d\n", 
         (int)(cyw43_state.netif[0].ip_addr.addr & 0xFF),
@@ -259,12 +271,57 @@ int main() {
             float voltage = (raw_adc * ADC_REF) / ADC_RES;
             float sound_level = fabs(voltage - SOUND_OFFSET);
 
-            if (sound_level > SOUND_THRESHOLD && !melody_active) {
-                melody_active = true;
-                update_led_status(true, true);
-                ssd1306_draw_string(ssd, 0, 32, "Som detectado!");
-                render_on_display(ssd, &frame_area);
-                play_melody(BUZZER_PIN);
+            if (system_active && !melody_active) {
+                static absolute_time_t last_sample;
+                
+                if (absolute_time_diff_us(last_sample, get_absolute_time()) >= SAMPLE_WINDOW_MS * 1000) {
+                    last_sample = get_absolute_time();
+                    
+                    // Leitura e processamento do ADC
+                    uint16_t raw_adc = adc_read();
+                    float voltage = (raw_adc * ADC_REF) / ADC_RES;
+                    float sound_level = fabs(voltage - SOUND_OFFSET);
+                    
+                    // Atualização do buffer circular
+                    uint32_t sample_value = (sound_level > SOUND_THRESHOLD) ? 1 : 0;
+                    
+                    // Subtrai a amostra mais antiga
+                    active_samples_count -= sample_buffer[sample_index];
+                    
+                    // Adiciona nova amostra
+                    sample_buffer[sample_index] = sample_value;
+                    active_samples_count += sample_value;
+                    
+                    // Atualiza índice circular
+                    sample_index = (sample_index + 1) % (DETECTION_DURATION_MS / SAMPLE_WINDOW_MS);
+                    
+                    // Cálculo do percentual de atividade
+                    float activity_percent = (active_samples_count * 100.0f) / (DETECTION_DURATION_MS / SAMPLE_WINDOW_MS);
+                    
+                    // Atualização do display
+                    char status[32];
+                    snprintf(status, sizeof(status), "Atividade: %d%%", (int)activity_percent);
+                    ssd1306_draw_string(ssd, 0, 32, status);
+                    render_on_display(ssd, &frame_area);
+                    
+                    // Debug no terminal
+                    printf("Nível: %.2f V | Amostras Ativas: %d/%d\n", 
+                          sound_level, active_samples_count, MIN_ACTIVE_SAMPLES);
+                    
+                    // Condição de disparo
+                    if (active_samples_count >= MIN_ACTIVE_SAMPLES) {
+                        printf("Choro detectado!\n");
+                        melody_active = true;
+                        update_led_status(true, true);
+                        ssd1306_draw_string(ssd, 0, 32, "Choro detectado!  ");
+                        render_on_display(ssd, &frame_area);
+                        play_melody(BUZZER_PIN);
+                        
+                        // Reset do buffer após detecção
+                        memset(sample_buffer, 0, sizeof(sample_buffer));
+                        active_samples_count = 0;
+                    }
+                }
             }
         }
 
