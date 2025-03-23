@@ -26,26 +26,44 @@ const uint LED_GREEN_PIN = 11;
 const uint LED_BLUE_PIN = 12; 
 
 // Wi-Fi
-#define WIFI_SSID "NOME_WIFI"
-#define WIFI_PASS "SENHA_WIFI"
+#define WIFI_SSID "nome da rede wifi"
+#define WIFI_PASS "senha da rede wifi"
 
 // Configurações do ADC para detecção de som
 const float SOUND_OFFSET = 1.65; 
-const float SOUND_THRESHOLD = 0.25; 
+const float SOUND_THRESHOLD = 0.18; 
 const float ADC_REF = 3.3;         
 const int ADC_RES = 4095;          
+
+const uint DETECTION_DURATION_MS = 10000; 
+const uint SAMPLE_WINDOW_MS = 50;         
+const uint MIN_ACTIVE_SAMPLES = 10;
+
+static uint32_t sample_buffer[200] = {0};  // Buffer circular para 10s
+static uint sample_index = 0;
+static uint active_samples_count = 0;
+
+static absolute_time_t detection_start_time;
+static uint sound_detection_count = 0;
+static bool is_detecting = false;
 
 // Estado do sistema
 volatile bool system_active = false;
 volatile bool melody_active = false;
+volatile bool cry_detected = false;  
+
 
 // HTML
 #define HTTP_RESPONSE "HTTP/1.1 200 OK\r\n" \
+                      "Cache-Control: no-cache, no-store, must-revalidate\r\n" \
+                      "Pragma: no-cache\r\n" \
+                      "Expires: 0\r\n" \
                       "Content-Type: text/html; charset=UTF-8\r\n\r\n" \
                       "<!DOCTYPE html>" \
                       "<html lang='pt-BR'>" \
                       "<head>" \
                       "  <meta charset='UTF-8'>" \
+                      "  <meta http-equiv='refresh' content='3'/>" \
                       "  <style>" \
                       "    body { font-family: Arial, sans-serif; background-color: #f0f0f0; margin: 20px; }" \
                       "    .container { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); max-width: 400px; margin: 0 auto; }" \
@@ -54,11 +72,13 @@ volatile bool melody_active = false;
                       "    .btn-on { background: #27ae60; color: white; }" \
                       "    .btn-off { background: #c0392b; color: white; }" \
                       "    .btn:hover { opacity: 0.9; }" \
+                      "    .alert { color: red; text-align: center; padding: 10px; margin: 10px; background: #ffe6e6; border-radius: 5px; }" \
                       "  </style>" \
                       "</head>" \
                       "<body>" \
                       "  <div class='container'>" \
                       "    <h1>Babá Eletrônica</h1>" \
+                      "    %s" \
                       "    <div style='text-align: center;'>" \
                       "      <a href='/system/on' class='btn btn-on'>Ligar Sistema</a>" \
                       "      <a href='/system/off' class='btn btn-off'>Desligar Sistema</a>" \
@@ -80,9 +100,21 @@ static err_t http_callback(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_
     } else if (strstr(request, "GET /system/off")) {
         system_active = false;
         melody_active = false;
+        cry_detected = false;
     }
 
-    tcp_write(tpcb, HTTP_RESPONSE, strlen(HTTP_RESPONSE), TCP_WRITE_FLAG_COPY);
+    // Gerar resposta dinâmica com buffer maior
+    char http_response[2048];  // Aumentado para 2KB
+    const char *alert = cry_detected ? "<div class='alert'>Choro detectado!</div>" : "";
+    
+    int len = snprintf(
+        http_response, 
+        sizeof(http_response),
+        HTTP_RESPONSE,
+        alert
+    );
+
+    tcp_write(tpcb, http_response, len < 2048 ? len : 2047, TCP_WRITE_FLAG_COPY);
     pbuf_free(p);
     return ERR_OK;
 }
@@ -212,16 +244,21 @@ int main() {
     // Wi-Fi
     if (cyw43_arch_init()) {
         printf("Erro ao inicializar o Wi-Fi\n");
-        return 1;
+        
     }
+    
+    bool connected = false;
+    while(connected == false){
+        cyw43_arch_enable_sta_mode();
+        printf("Conectando ao Wi-Fi...\n");
 
-    cyw43_arch_enable_sta_mode();
-    printf("Conectando ao Wi-Fi...\n");
-
-    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 10000)){
-        printf("Falha ao conectar ao Wi-Fi\n");
-        return 1;
-    } 
+        if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 10000)){
+            printf("Falha ao conectar ao Wi-Fi\n");
+            continue;
+        }
+        connected = true;
+    }
+    
     printf("Conectado!\nIP: %d.%d.%d.%d\n", 
         (int)(cyw43_state.netif[0].ip_addr.addr & 0xFF),
         (int)((cyw43_state.netif[0].ip_addr.addr >> 8) & 0xFF),
@@ -242,6 +279,7 @@ int main() {
         if (gpio_get(BUTTON_B_PIN) == 0) {
             system_active = false;
             melody_active = false;
+            cry_detected = false;
             sleep_ms(200);
         }
 
@@ -259,12 +297,58 @@ int main() {
             float voltage = (raw_adc * ADC_REF) / ADC_RES;
             float sound_level = fabs(voltage - SOUND_OFFSET);
 
-            if (sound_level > SOUND_THRESHOLD && !melody_active) {
-                melody_active = true;
-                update_led_status(true, true);
-                ssd1306_draw_string(ssd, 0, 32, "Som detectado!");
-                render_on_display(ssd, &frame_area);
-                play_melody(BUZZER_PIN);
+            if (system_active && !melody_active) {
+                static absolute_time_t last_sample;
+                
+                if (absolute_time_diff_us(last_sample, get_absolute_time()) >= SAMPLE_WINDOW_MS * 1000) {
+                    last_sample = get_absolute_time();
+                    
+                    // Leitura e processamento do ADC
+                    uint16_t raw_adc = adc_read();
+                    float voltage = (raw_adc * ADC_REF) / ADC_RES;
+                    float sound_level = fabs(voltage - SOUND_OFFSET);
+                    
+                    // Atualização do buffer circular
+                    uint32_t sample_value = (sound_level > SOUND_THRESHOLD) ? 1 : 0;
+                    
+                    // Subtrai a amostra mais antiga
+                    active_samples_count -= sample_buffer[sample_index];
+                    
+                    // Adiciona nova amostra
+                    sample_buffer[sample_index] = sample_value;
+                    active_samples_count += sample_value;
+                    
+                    // Atualiza índice circular
+                    sample_index = (sample_index + 1) % (DETECTION_DURATION_MS / SAMPLE_WINDOW_MS);
+                    
+                    // Cálculo do percentual de atividade
+                    float activity_percent = (active_samples_count * 100.0f) / (DETECTION_DURATION_MS / SAMPLE_WINDOW_MS);
+                    
+                    // Atualização do display
+                    char status[32];
+                    snprintf(status, sizeof(status), "Atividade: %d%%", (int)activity_percent);
+                    ssd1306_draw_string(ssd, 0, 32, status);
+                    render_on_display(ssd, &frame_area);
+                    
+                    // Debug no terminal
+                    printf("Nível: %.2f V | Amostras Ativas: %d/%d\n", 
+                          sound_level, active_samples_count, MIN_ACTIVE_SAMPLES);
+                    
+                    // Condição de disparo
+                    if (active_samples_count >= MIN_ACTIVE_SAMPLES) {
+                        printf("Choro detectado!\n");
+                        melody_active = true;
+                        cry_detected = true;
+                        update_led_status(true, true);
+                        ssd1306_draw_string(ssd, 0, 32, "Choro detectado!  ");
+                        render_on_display(ssd, &frame_area);
+                        play_melody(BUZZER_PIN);
+                        
+                        // Reset do buffer após detecção
+                        memset(sample_buffer, 0, sizeof(sample_buffer));
+                        active_samples_count = 0;
+                    }
+                }
             }
         }
 
